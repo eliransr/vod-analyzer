@@ -1,3 +1,4 @@
+import 'dotenv/config';
 import express from 'express';
 import crypto from 'crypto';
 import { scrapeReddit } from './src/scrapers/reddit';

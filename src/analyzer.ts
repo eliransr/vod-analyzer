@@ -1,23 +1,69 @@
 import OpenAI from 'openai';
 import { CommonPost, VoDReport } from './types';
 
-const client = new OpenAI({
-  baseURL: 'https://openrouter.ai/api/v1',
-  apiKey: process.env.OPENROUTER_API_KEY || '',
-});
+/**
+ * LLM client setup — supports three providers (in priority order):
+ * 1. ANTHROPIC_API_KEY → Anthropic Claude API directly (model: claude-sonnet-4-20250514)
+ * 2. GEMINI_API_KEY → Google Gemini API (free tier, model: gemini-2.0-flash-lite)
+ * 3. OPENROUTER_API_KEY → OpenRouter (model: anthropic/claude-3.5-sonnet)
+ */
+const anthropicKey = process.env.ANTHROPIC_API_KEY;
+const geminiKey = process.env.GEMINI_API_KEY;
+
+let client: InstanceType<typeof OpenAI>;
+let model: string;
+
+if (anthropicKey) {
+  client = new OpenAI({
+    baseURL: 'https://api.anthropic.com/v1/',
+    apiKey: anthropicKey,
+    defaultHeaders: { 'anthropic-version': '2023-06-01' },
+  });
+  model = 'claude-sonnet-4-20250514';
+} else if (geminiKey) {
+  client = new OpenAI({
+    baseURL: 'https://generativelanguage.googleapis.com/v1beta/openai/',
+    apiKey: geminiKey,
+  });
+  model = 'gemini-2.0-flash-lite';
+} else {
+  client = new OpenAI({
+    baseURL: 'https://openrouter.ai/api/v1',
+    apiKey: process.env.OPENROUTER_API_KEY || '',
+  });
+  model = 'anthropic/claude-3.5-sonnet';
+}
+
+/** Retry with exponential backoff on 429 rate-limit errors */
+async function callWithRetry<T>(fn: () => Promise<T>, retries = 3, delayMs = 10000): Promise<T> {
+  for (let i = 0; i <= retries; i++) {
+    try {
+      return await fn();
+    } catch (err: any) {
+      if (err?.status === 429 && i < retries) {
+        console.log(`Rate limited (429), retrying in ${delayMs / 1000}s... (${i + 1}/${retries})`);
+        await new Promise(r => setTimeout(r, delayMs));
+        delayMs *= 2;
+      } else {
+        throw err;
+      }
+    }
+  }
+  throw new Error('Max retries reached');
+}
 
 export async function analyze(keyword: string, posts: CommonPost[]): Promise<VoDReport> {
   const sourceCounts = { reddit: 0, github: 0, stackoverflow: 0, hackernews: 0 };
   for (const p of posts) sourceCounts[p.source]++;
 
-  const sliced = posts.slice(0, 80);
+  const sliced = posts.slice(0, geminiKey ? 40 : 80);
   const postsText = sliced.map((p, i) =>
     `[#${i}][${p.source}] ${p.title}\n${p.body.slice(0, 300)}`
   ).join('\n---\n');
 
-  const response = await client.chat.completions.create({
-    model: 'anthropic/claude-3.5-sonnet',
-    response_format: { type: 'json_object' },
+  const response = await callWithRetry(() => client.chat.completions.create({
+    model,
+    ...(anthropicKey ? {} : { response_format: { type: 'json_object' as const } }),
     messages: [{
       role: 'user',
       content: `Analyze these ${sliced.length} developer posts about "${keyword}" from Reddit, GitHub, Stack Overflow, and HackerNews.
@@ -51,7 +97,7 @@ IMPORTANT: For every example_quote and notable quote, set source_index to the in
 Posts:
 ${postsText}`,
     }],
-  });
+  }));
 
   const text = response.choices[0].message.content || '';
   const match = text.match(/\{[\s\S]*\}/);
